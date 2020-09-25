@@ -39,7 +39,7 @@ impl PSTcpServer {
         match rx.recv() {
           Ok(data) => {
             let a = connections_1.lock().unwrap();
-            for (_token, stream) in (connections_1.lock().unwrap()).iter_mut() {
+            for (_token, stream) in &mut (connections_1.lock().unwrap()).iter_mut() {
               match stream.write(data) {
                 // Ok(n) if n < data.len() => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(_) => {}
