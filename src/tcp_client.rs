@@ -14,43 +14,83 @@ use std::time::Duration;
 type SyncSender<T> = std::sync::mpsc::Sender<T>;
 type SyncReceiver<T> = std::sync::mpsc::Receiver<T>;
 
+pub struct OneSubscribe {
+  pub addr: String,
+  pub topics: Vec<String>,
+}
+
+pub struct SubscribeTopics {
+  pub subs: Vec<OneSubscribe>,
+}
+
 pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<Vec<u8>> {
+  let mut subs = Vec::new();
+  for addr in addrs {
+    let sub = OneSubscribe {
+      addr,
+      topics: Vec::new(),
+    };
+    subs.push(sub);
+  }
+  let config = SubscribeTopics { subs };
   let (tx, rx) = std::sync::mpsc::channel();
   thread::spawn(move || {
-    if let Err(err) = task::block_on(runtime(addrs, tx)) {
+    if let Err(err) = task::block_on(run_multi_clients(config, tx)) {
       error!("err = {}", err);
     }
   });
   rx
 }
 
-async fn runtime(addrs: Vec<String>, tx: SyncSender<Vec<u8>>) -> Result<()> {
+pub fn start_tcp_client_with_topics(config: SubscribeTopics) -> SyncReceiver<Vec<u8>> {
+  let (tx, rx) = std::sync::mpsc::channel();
+  thread::spawn(move || {
+    if let Err(err) = task::block_on(run_multi_clients(config, tx)) {
+      error!("err = {}", err);
+    }
+  });
+  rx
+}
+
+async fn run_multi_clients(config: SubscribeTopics, tx: SyncSender<Vec<u8>>) -> Result<()> {
   let mut tasks = Vec::new();
-  for addr in addrs.into_iter() {
-    let t = spawn_and_log_error(client(addr, tx.clone()));
+  for sub in config.subs.into_iter() {
+    let t = spawn_and_log_error(client(sub, tx.clone()));
     tasks.push(t);
   }
   future::join_all(tasks).await;
   Ok(())
 }
 
-async fn client(addr: String, tx: SyncSender<Vec<u8>>) -> Result<()> {
+async fn client(sub: OneSubscribe, tx: SyncSender<Vec<u8>>) -> Result<()> {
   loop {
-    match TcpStream::connect(&addr).await {
+    match TcpStream::connect(&sub.addr).await {
       Ok(stream) => {
-        trace!("Connected to {}", &stream.peer_addr()?);
+        debug!("Connected to {}", &stream.peer_addr()?);
         let (reader, mut writer) = (&stream, &stream);
         let reader = BufReader::new(reader);
         let mut lines_from_server = StreamExt::fuse(reader.lines());
 
-        let msg = MsgSubscribeAll {
-          version: "1.0.0".to_string(),
-          msgtype: MSG_TYPE_SUBSCRIBE_ALL.to_string(),
-        };
-        let subscribe_msg = serde_json::to_string(&msg)?;
-        writer.write_all(subscribe_msg.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        trace!("Subscribe to all topics");
+        if sub.topics.is_empty() {
+          let msg = MsgSubscribeAll {
+            version: "1.0.0".to_string(),
+            msgtype: MSG_TYPE_SUBSCRIBE_ALL.to_string(),
+          };
+          let subscribe_msg = serde_json::to_string(&msg)?;
+          writer.write_all(subscribe_msg.as_bytes()).await?;
+          writer.write_all(b"\n").await?;
+          debug!("Subscribe to all topics");
+        } else {
+          let msg = MsgSubscribe {
+            version: "1.0.0".to_string(),
+            msgtype: MSG_TYPE_SUBSCRIBE.to_string(),
+            topics: sub.topics.clone(),
+          };
+          let subscribe_msg = serde_json::to_string(&msg)?;
+          writer.write_all(subscribe_msg.as_bytes()).await?;
+          writer.write_all(b"\n").await?;
+          debug!("Subscribe to topics: {:?}", sub.topics);
+        }
 
         loop {
           select! {

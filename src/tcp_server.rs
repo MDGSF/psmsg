@@ -108,7 +108,7 @@ async fn connection_loop(
 
   while let Some(line) = lines.next().await {
     let line = line?;
-    trace!("[{}]: {}", client_id, line);
+    debug!("[{}]: {}", client_id, line);
 
     let msg: MsgHeader = match serde_json::from_str(&line) {
       Ok(msg) => msg,
@@ -227,13 +227,15 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
               }
             },
             EventClient::Subscribe { id, topics } => {
-              for topic in topics {
-                t2c.entry(topic.clone()).or_insert_with(|| HashSet::new()).insert(id);
-                c2t.entry(id).or_insert_with(|| HashSet::new()).insert(topic);
+              if !suball.contains(&id) {
+                for topic in topics {
+                  t2c.entry(topic.clone()).or_insert_with(|| HashSet::new()).insert(id);
+                  c2t.entry(id).or_insert_with(|| HashSet::new()).insert(topic);
+                }
               }
             },
             EventClient::SubscribeAll { id } => {
-                trace!("[{}]: subscribe all topics", id);
+                debug!("[{}]: subscribe all topics", id);
                 suball.insert(id);
             }
           }
@@ -243,7 +245,7 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
       event = rx_new_data.next().fuse() => match event {
         Some(event) => match event {
           EventServer::Publish { topic, mut data } => {
-            trace!("publish message");
+            debug!("publish message, topic = {}", topic);
             data.push(b'\n');
             if let Some(client_ids) = t2c.get_mut(&topic) {
               for client_id in client_ids.iter() {
@@ -252,9 +254,14 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
                 }
               }
             }
+            for id in suball.iter() {
+              if let Some(client) = peers.get_mut(&id) {
+                client.send(data.clone()).await.unwrap();
+              }
+            }
           }
           EventServer::PublishAll { mut data } => {
-            trace!("publish all");
+            debug!("publish all");
             data.push(b'\n');
             for id in suball.iter() {
               if let Some(client) = peers.get_mut(&id) {
