@@ -18,7 +18,7 @@ pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<Vec<u8>> {
   let (tx, rx) = std::sync::mpsc::channel();
   thread::spawn(move || {
     if let Err(err) = task::block_on(runtime(addrs, tx)) {
-      println!("err = {}", err);
+      error!("err = {}", err);
     }
   });
   rx
@@ -38,7 +38,7 @@ async fn client(addr: String, tx: SyncSender<Vec<u8>>) -> Result<()> {
   loop {
     match TcpStream::connect(&addr).await {
       Ok(stream) => {
-        println!("Connected to {}", &stream.peer_addr()?);
+        trace!("Connected to {}", &stream.peer_addr()?);
         let (reader, mut writer) = (&stream, &stream);
         let reader = BufReader::new(reader);
         let mut lines_from_server = StreamExt::fuse(reader.lines());
@@ -50,14 +50,13 @@ async fn client(addr: String, tx: SyncSender<Vec<u8>>) -> Result<()> {
         let subscribe_msg = serde_json::to_string(&msg)?;
         writer.write_all(subscribe_msg.as_bytes()).await?;
         writer.write_all(b"\n").await?;
-        println!("Subscribe to all topics");
+        trace!("Subscribe to all topics");
 
         loop {
           select! {
             line = lines_from_server.next().fuse() => match line {
               Some(line) => {
                 let line = line?;
-                println!("{}", line);
                 tx.send(line.as_bytes().to_vec()).unwrap();
               }
               None => break,
@@ -66,7 +65,7 @@ async fn client(addr: String, tx: SyncSender<Vec<u8>>) -> Result<()> {
         }
       }
       Err(err) => {
-        println!("err = {}", err);
+        error!("err = {}", err);
         task::sleep(Duration::from_secs(5)).await;
         continue;
       }

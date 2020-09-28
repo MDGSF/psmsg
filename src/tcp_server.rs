@@ -57,7 +57,7 @@ pub fn start_tcp_server(addr: String) -> Publisher {
 
   thread::spawn(move || {
     if let Err(err) = task::block_on(accept_loop(addr, rx_new_data)) {
-      println!("err = {}", err);
+      error!("err = {}", err);
     }
   });
 
@@ -66,7 +66,7 @@ pub fn start_tcp_server(addr: String) -> Publisher {
 
 async fn accept_loop(addr: impl ToSocketAddrs, rx_new_data: Receiver<EventServer>) -> Result<()> {
   let listener = TcpListener::bind(addr).await?;
-  println!("Listening on {}", listener.local_addr()?);
+  info!("Listening on {}", listener.local_addr()?);
 
   let mut uniq_client_id: usize = 0;
   let (broker_sender, broker_receiver) = mpsc::unbounded();
@@ -74,7 +74,7 @@ async fn accept_loop(addr: impl ToSocketAddrs, rx_new_data: Receiver<EventServer
   let mut incoming = listener.incoming();
   while let Some(stream) = incoming.next().await {
     let stream = stream?;
-    println!("Accepting from: {}", stream.peer_addr()?);
+    info!("Accepting from: {}", stream.peer_addr()?);
     uniq_client_id += 1;
     spawn_and_log_error(connection_loop(
       uniq_client_id,
@@ -108,21 +108,35 @@ async fn connection_loop(
 
   while let Some(line) = lines.next().await {
     let line = line?;
-    println!("[{}]: {}", client_id, line);
+    trace!("[{}]: {}", client_id, line);
 
     let msg: MsgHeader = match serde_json::from_str(&line) {
       Ok(msg) => msg,
       Err(err) => {
-        println!("recv failed, err = {:?}", err);
+        error!("parse json failed, err = {:?}", err);
         continue;
       }
     };
 
     match msg.msgtype.as_str() {
-      MSG_TYPE_SUBSCRIBE => {}
+      MSG_TYPE_SUBSCRIBE => {
+        let msg: MsgSubscribe = match serde_json::from_str(&line) {
+          Ok(msg) => msg,
+          Err(err) => {
+            error!("parse json failed, err = {:?}", err);
+            continue;
+          }
+        };
+        broker
+          .send(EventClient::Subscribe {
+            id: client_id,
+            topics: msg.topics,
+          })
+          .await?;
+      }
       MSG_TYPE_SUBSCRIBE_ALL => {
         broker
-          .send(EventClient::SubscribeAll { from: client_id })
+          .send(EventClient::SubscribeAll { id: client_id })
           .await?;
       }
       &_ => {}
@@ -160,8 +174,12 @@ enum EventClient {
     stream: Arc<TcpStream>,
     shutdown: Receiver<Void>,
   },
+  Subscribe {
+    id: usize,
+    topics: Vec<String>,
+  },
   SubscribeAll {
-    from: usize,
+    id: usize,
   },
 }
 
@@ -176,7 +194,8 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
   let mut peers: HashMap<usize, Sender<Vec<u8>>> = HashMap::new();
 
   // <topic, set<client_id>>
-  let _subm: HashMap<String, HashSet<usize>> = HashMap::new();
+  let mut t2c: HashMap<String, HashSet<usize>> = HashMap::new();
+  let mut c2t: HashMap<usize, HashSet<String>> = HashMap::new();
 
   // subscribe all topic's client's id
   let mut suball: HashSet<usize> = HashSet::new();
@@ -207,9 +226,15 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
                 });
               }
             },
-            EventClient::SubscribeAll { from } => {
-                println!("[{}]: subscribe all topics", from);
-                suball.insert(from);
+            EventClient::Subscribe { id, topics } => {
+              for topic in topics {
+                t2c.entry(topic.clone()).or_insert_with(|| HashSet::new()).insert(id);
+                c2t.entry(id).or_insert_with(|| HashSet::new()).insert(topic);
+              }
+            },
+            EventClient::SubscribeAll { id } => {
+                trace!("[{}]: subscribe all topics", id);
+                suball.insert(id);
             }
           }
         },
@@ -217,23 +242,24 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
       },
       event = rx_new_data.next().fuse() => match event {
         Some(event) => match event {
-          EventServer::Publish { .. } => {
-              println!("publish message");
-          }
-          EventServer::PublishAll { mut data } => {
-            println!("publish all");
+          EventServer::Publish { topic, mut data } => {
+            trace!("publish message");
             data.push(b'\n');
-            let mut invalid_clients = HashSet::new();
-            for id in suball.iter() {
-              if let Some(client) = peers.get_mut(&id) {
-                if let Err(err) = client.send(data.clone()).await {
-                  println!("write to client failed, err = {}", err);
-                  invalid_clients.insert(id);
+            if let Some(client_ids) = t2c.get_mut(&topic) {
+              for client_id in client_ids.iter() {
+                if let Some(client) = peers.get_mut(&client_id) {
+                  client.send(data.clone()).await.unwrap();
                 }
               }
             }
-            for client_id in invalid_clients {
-              peers.remove(&client_id);
+          }
+          EventServer::PublishAll { mut data } => {
+            trace!("publish all");
+            data.push(b'\n');
+            for id in suball.iter() {
+              if let Some(client) = peers.get_mut(&id) {
+                client.send(data.clone()).await.unwrap();
+              }
             }
           }
         }
@@ -242,6 +268,15 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
       disconnect = disconnect_receiver.next().fuse() => {
         let (id, _pending_messages) = disconnect.unwrap();
         assert!(peers.remove(&id).is_some());
+        suball.remove(&id);
+        if let Some(topics) = c2t.get_mut(&id) {
+          for topic in topics.iter() {
+            if let Some(client_ids) = t2c.get_mut(topic) {
+              client_ids.remove(&id);
+            }
+          }
+          c2t.remove(&id);
+        }
         continue;
       },
     }
