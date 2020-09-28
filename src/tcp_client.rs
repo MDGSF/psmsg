@@ -1,9 +1,13 @@
 use crate::common::*;
+use crate::messages::*;
 use anyhow::Result;
+use async_std::io::BufReader;
 use async_std::net::TcpStream;
 use async_std::prelude::*;
 use async_std::task;
 use futures::future;
+use futures::{select, FutureExt};
+use serde_json;
 use std::thread;
 use std::time::Duration;
 
@@ -33,16 +37,32 @@ async fn runtime(addrs: Vec<String>, tx: SyncSender<Vec<u8>>) -> Result<()> {
 async fn client(addr: String, tx: SyncSender<Vec<u8>>) -> Result<()> {
   loop {
     match TcpStream::connect(&addr).await {
-      Ok(mut stream) => {
+      Ok(stream) => {
         println!("Connected to {}", &stream.peer_addr()?);
+        let (reader, mut writer) = (&stream, &stream);
+        let reader = BufReader::new(reader);
+        let mut lines_from_server = StreamExt::fuse(reader.lines());
+
+        let msg = MsgSubscribeAll {
+          version: "1.0.0".to_string(),
+          msgtype: MSG_TYPE_SUBSCRIBE_ALL.to_string(),
+        };
+        let subscribe_msg = serde_json::to_string(&msg)?;
+        writer.write_all(subscribe_msg.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        println!("Subscribe to all topics");
+
         loop {
-          let mut buf = vec![0u8; 1024];
-          let n = stream.read(&mut buf).await?;
-          if n == 0 {
-            println!("EOF");
-            break;
+          select! {
+            line = lines_from_server.next().fuse() => match line {
+              Some(line) => {
+                let line = line?;
+                println!("{}", line);
+                tx.send(line.as_bytes().to_vec()).unwrap();
+              }
+              None => break,
+            },
           }
-          tx.send(buf[..n].to_vec()).unwrap();
         }
       }
       Err(err) => {
