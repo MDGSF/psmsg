@@ -23,7 +23,13 @@ pub struct SubscribeTopics {
   pub subs: Vec<OneSubscribe>,
 }
 
-pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<Vec<u8>> {
+pub struct RawMessage {
+  pub source: String,
+  pub topic: String,
+  pub data: Vec<u8>,
+}
+
+pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<RawMessage> {
   let mut subs = Vec::new();
   for addr in addrs {
     let sub = OneSubscribe {
@@ -42,7 +48,7 @@ pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<Vec<u8>> {
   rx
 }
 
-pub fn start_tcp_client_with_topics(config: SubscribeTopics) -> SyncReceiver<Vec<u8>> {
+pub fn start_tcp_client_with_topics(config: SubscribeTopics) -> SyncReceiver<RawMessage> {
   let (tx, rx) = std::sync::mpsc::channel();
   thread::spawn(move || {
     if let Err(err) = task::block_on(run_multi_clients(config, tx)) {
@@ -52,7 +58,7 @@ pub fn start_tcp_client_with_topics(config: SubscribeTopics) -> SyncReceiver<Vec
   rx
 }
 
-async fn run_multi_clients(config: SubscribeTopics, tx: SyncSender<Vec<u8>>) -> Result<()> {
+async fn run_multi_clients(config: SubscribeTopics, tx: SyncSender<RawMessage>) -> Result<()> {
   let mut tasks = Vec::new();
   for sub in config.subs.into_iter() {
     let t = spawn_and_log_error(client(sub, tx.clone()));
@@ -62,7 +68,7 @@ async fn run_multi_clients(config: SubscribeTopics, tx: SyncSender<Vec<u8>>) -> 
   Ok(())
 }
 
-async fn client(sub: OneSubscribe, tx: SyncSender<Vec<u8>>) -> Result<()> {
+async fn client(sub: OneSubscribe, tx: SyncSender<RawMessage>) -> Result<()> {
   loop {
     match TcpStream::connect(&sub.addr).await {
       Ok(stream) => {
@@ -97,7 +103,21 @@ async fn client(sub: OneSubscribe, tx: SyncSender<Vec<u8>>) -> Result<()> {
             line = lines_from_server.next().fuse() => match line {
               Some(line) => {
                 let line = line?;
-                tx.send(line.as_bytes().to_vec()).unwrap();
+
+                let msg: MsgPublish = match serde_json::from_str(&line) {
+                  Ok(msg) => msg,
+                  Err(err) => {
+                    error!("parse json failed, err = {:?}", err);
+                    continue;
+                  }
+                };
+                debug!("msg = {:?}", msg);
+
+                tx.send(RawMessage {
+                  source: msg.source,
+                  topic: msg.topic,
+                  data: msg.data,
+                }).unwrap();
               }
               None => break,
             },

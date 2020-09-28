@@ -1,5 +1,5 @@
-use psmsg;
 use anyhow::Result;
+use psmsg;
 
 fn main() -> Result<()> {
   env_logger::init();
@@ -19,7 +19,12 @@ fn main() -> Result<()> {
 
   let rx = psmsg::start_tcp_client_with_topics(config);
   loop {
-    let data = rx.recv()?;
-    println!("data = {}", String::from_utf8(data).unwrap());
+    let msg = rx.recv()?;
+    println!(
+      "[{}]<{}>: {}",
+      msg.source,
+      msg.topic,
+      String::from_utf8(msg.data).unwrap()
+    );
   }
 }

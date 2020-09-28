@@ -46,7 +46,7 @@ impl Publisher {
           topic: topic.to_string(),
           data,
         })
-        .await
+      .await
         .unwrap()
     });
   }
@@ -77,9 +77,9 @@ async fn accept_loop(addr: impl ToSocketAddrs, rx_new_data: Receiver<EventServer
     info!("Accepting from: {}", stream.peer_addr()?);
     uniq_client_id += 1;
     spawn_and_log_error(connection_loop(
-      uniq_client_id,
-      broker_sender.clone(),
-      stream,
+        uniq_client_id,
+        broker_sender.clone(),
+        stream,
     ));
   }
   drop(broker_sender);
@@ -104,46 +104,46 @@ async fn connection_loop(
       stream: Arc::clone(&stream),
       shutdown: shutdown_receiver,
     })
-    .await?;
+  .await?;
 
-  while let Some(line) = lines.next().await {
-    let line = line?;
-    debug!("[{}]: {}", client_id, line);
+    while let Some(line) = lines.next().await {
+      let line = line?;
+      debug!("[{}]: {}", client_id, line);
 
-    let msg: MsgHeader = match serde_json::from_str(&line) {
-      Ok(msg) => msg,
-      Err(err) => {
-        error!("parse json failed, err = {:?}", err);
-        continue;
-      }
-    };
+      let msg: MsgHeader = match serde_json::from_str(&line) {
+        Ok(msg) => msg,
+        Err(err) => {
+          error!("parse json failed, err = {:?}", err);
+          continue;
+        }
+      };
 
-    match msg.msgtype.as_str() {
-      MSG_TYPE_SUBSCRIBE => {
-        let msg: MsgSubscribe = match serde_json::from_str(&line) {
-          Ok(msg) => msg,
-          Err(err) => {
-            error!("parse json failed, err = {:?}", err);
-            continue;
-          }
-        };
-        broker
-          .send(EventClient::Subscribe {
-            id: client_id,
-            topics: msg.topics,
-          })
+      match msg.msgtype.as_str() {
+        MSG_TYPE_SUBSCRIBE => {
+          let msg: MsgSubscribe = match serde_json::from_str(&line) {
+            Ok(msg) => msg,
+            Err(err) => {
+              error!("parse json failed, err = {:?}", err);
+              continue;
+            }
+          };
+          broker
+            .send(EventClient::Subscribe {
+              id: client_id,
+              topics: msg.topics,
+            })
           .await?;
+            }
+        MSG_TYPE_SUBSCRIBE_ALL => {
+          broker
+            .send(EventClient::SubscribeAll { id: client_id })
+            .await?;
+            }
+        &_ => {}
       }
-      MSG_TYPE_SUBSCRIBE_ALL => {
-        broker
-          .send(EventClient::SubscribeAll { id: client_id })
-          .await?;
-      }
-      &_ => {}
     }
-  }
 
-  Ok(())
+    Ok(())
 }
 
 async fn connection_writer_loop(
@@ -235,8 +235,8 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
               }
             },
             EventClient::SubscribeAll { id } => {
-                debug!("[{}]: subscribe all topics", id);
-                suball.insert(id);
+              debug!("[{}]: subscribe all topics", id);
+              suball.insert(id);
             }
           }
         },
@@ -246,26 +246,42 @@ async fn broker_loop(mut events: Receiver<EventClient>, mut rx_new_data: Receive
         Some(event) => match event {
           EventServer::Publish { topic, mut data } => {
             debug!("publish message, topic = {}", topic);
-            data.push(b'\n');
+            let msg = MsgPublish {
+              version: "1.0.0".to_string(),
+              msgtype: MSG_TYPE_PUBLISH.to_string(),
+              source: "tcp_server".to_string(),
+              topic: topic.clone(),
+              data: data,
+            };
+            let mut msg = serde_json::to_vec(&msg).unwrap();
+            msg.push(b'\n');
             if let Some(client_ids) = t2c.get_mut(&topic) {
               for client_id in client_ids.iter() {
                 if let Some(client) = peers.get_mut(&client_id) {
-                  client.send(data.clone()).await.unwrap();
+                  client.send(msg.clone()).await.unwrap();
                 }
               }
             }
             for id in suball.iter() {
               if let Some(client) = peers.get_mut(&id) {
-                client.send(data.clone()).await.unwrap();
+                client.send(msg.clone()).await.unwrap();
               }
             }
           }
           EventServer::PublishAll { mut data } => {
             debug!("publish all");
-            data.push(b'\n');
+            let msg = MsgPublish {
+              version: "1.0.0".to_string(),
+              msgtype: MSG_TYPE_PUBLISH.to_string(),
+              source: "tcp_server".to_string(),
+              topic: "*".to_string(),
+              data: data,
+            };
+            let mut msg = serde_json::to_vec(&msg).unwrap();
+            msg.push(b'\n');
             for id in suball.iter() {
               if let Some(client) = peers.get_mut(&id) {
-                client.send(data.clone()).await.unwrap();
+                client.send(msg.clone()).await.unwrap();
               }
             }
           }
