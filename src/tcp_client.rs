@@ -3,7 +3,6 @@ use crate::messages::*;
 use anyhow::Result;
 use async_std::{io::BufReader, net::TcpStream, prelude::*, task};
 use futures::{channel::mpsc, select, FutureExt, SinkExt};
-use serde_json;
 use std::{thread, time::Duration};
 
 type Sender<T> = mpsc::UnboundedSender<T>;
@@ -125,23 +124,12 @@ async fn client(sub: OneSubscribeConfig, tx_msg: SyncSender<RawMessage>) -> Resu
         let mut lines_from_server = StreamExt::fuse(reader.lines());
 
         if sub.topics.is_empty() {
-          let msg = MsgSubscribeAll {
-            version: "1.0.0".to_string(),
-            msgtype: MSG_TYPE_SUBSCRIBE_ALL.to_string(),
-          };
-          let subscribe_msg = serde_json::to_string(&msg)?;
-          writer.write_all(subscribe_msg.as_bytes()).await?;
-          writer.write_all(b"\n").await?;
+          let msg = MsgSubscribeAll::encode();
+          writer.write_all(&msg).await?;
           debug!("Subscribe to all topics");
         } else {
-          let msg = MsgSubscribe {
-            version: "1.0.0".to_string(),
-            msgtype: MSG_TYPE_SUBSCRIBE.to_string(),
-            topics: sub.topics.clone(),
-          };
-          let subscribe_msg = serde_json::to_string(&msg)?;
-          writer.write_all(subscribe_msg.as_bytes()).await?;
-          writer.write_all(b"\n").await?;
+          let msg = MsgSubscribe::encode(sub.topics.clone());
+          writer.write_all(&msg).await?;
           debug!("Subscribe to topics: {:?}", sub.topics);
         }
 
@@ -150,14 +138,7 @@ async fn client(sub: OneSubscribeConfig, tx_msg: SyncSender<RawMessage>) -> Resu
             line = lines_from_server.next().fuse() => match line {
               Some(line) => {
                 let line = line?;
-
-                let msg: MsgPublish = match serde_json::from_str(&line) {
-                  Ok(msg) => msg,
-                  Err(err) => {
-                    error!("parse json failed, err = {:?}", err);
-                    continue;
-                  }
-                };
+                let msg = MsgPublish::decode(&line);
                 debug!("msg = {:?}", msg);
 
                 tx_msg.send(RawMessage {

@@ -112,23 +112,10 @@ async fn connection_loop(
     let line = line?;
     debug!("[{}]: {}", client_id, line);
 
-    let msg: MsgHeader = match serde_json::from_str(&line) {
-      Ok(msg) => msg,
-      Err(err) => {
-        error!("parse json failed, err = {:?}", err);
-        continue;
-      }
-    };
-
+    let msg = MsgHeader::decode(&line);
     match msg.msgtype.as_str() {
       MSG_TYPE_SUBSCRIBE => {
-        let msg: MsgSubscribe = match serde_json::from_str(&line) {
-          Ok(msg) => msg,
-          Err(err) => {
-            error!("parse json failed, err = {:?}", err);
-            continue;
-          }
-        };
+        let msg = MsgSubscribe::decode(&line);
         broker
           .send(EventClient::Subscribe {
             id: client_id,
@@ -249,17 +236,9 @@ async fn broker_loop(
       },
       event = rx_event_user.next().fuse() => match event {
         Some(event) => match event {
-          EventUser::Publish { topic, mut data } => {
+          EventUser::Publish { topic, data } => {
             debug!("publish message, topic = {}", topic);
-            let msg = MsgPublish {
-              version: "1.0.0".to_string(),
-              msgtype: MSG_TYPE_PUBLISH.to_string(),
-              source: "tcp_server".to_string(),
-              topic: topic.clone(),
-              data: data,
-            };
-            let mut msg = serde_json::to_vec(&msg).unwrap();
-            msg.push(b'\n');
+            let msg = MsgPublish::encode(&topic, data);
             if let Some(client_ids) = t2c.get_mut(&topic) {
               for client_id in client_ids.iter() {
                 if let Some(client) = peers.get_mut(&client_id) {
@@ -273,17 +252,9 @@ async fn broker_loop(
               }
             }
           }
-          EventUser::PublishAll { mut data } => {
+          EventUser::PublishAll { data } => {
             debug!("publish all");
-            let msg = MsgPublish {
-              version: "1.0.0".to_string(),
-              msgtype: MSG_TYPE_PUBLISH.to_string(),
-              source: "tcp_server".to_string(),
-              topic: "*".to_string(),
-              data: data,
-            };
-            let mut msg = serde_json::to_vec(&msg).unwrap();
-            msg.push(b'\n');
+            let msg = MsgPublish::encode("*", data);
             for (client_id, mut client) in peers.iter() {
               client.send(msg.clone()).await.unwrap();
             }
