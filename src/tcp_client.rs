@@ -1,74 +1,121 @@
 use crate::common::*;
 use crate::messages::*;
 use anyhow::Result;
-use async_std::io::BufReader;
-use async_std::net::TcpStream;
-use async_std::prelude::*;
-use async_std::task;
-use futures::future;
-use futures::{select, FutureExt};
+use async_std::{io::BufReader, net::TcpStream, prelude::*, task};
+use futures::{channel::mpsc, select, FutureExt, SinkExt};
 use serde_json;
-use std::thread;
-use std::time::Duration;
+use std::{thread, time::Duration};
 
+type Sender<T> = mpsc::UnboundedSender<T>;
+type Receiver<T> = mpsc::UnboundedReceiver<T>;
 type SyncSender<T> = std::sync::mpsc::Sender<T>;
 type SyncReceiver<T> = std::sync::mpsc::Receiver<T>;
 
-pub struct OneSubscribe {
+#[derive(Debug)]
+pub struct OneSubscribeConfig {
   pub addr: String,
   pub topics: Vec<String>,
 }
 
-pub struct SubscribeTopics {
-  pub subs: Vec<OneSubscribe>,
+#[derive(Debug)]
+pub struct SubscribeConfigs {
+  pub subs: Vec<OneSubscribeConfig>,
 }
 
+#[derive(Debug)]
 pub struct RawMessage {
   pub source: String,
   pub topic: String,
   pub data: Vec<u8>,
 }
 
-pub fn start_tcp_client(addrs: Vec<String>) -> SyncReceiver<RawMessage> {
+#[derive(Debug)]
+enum EventUser {
+  AddNewClient(OneSubscribeConfig),
+}
+
+pub struct Subscriber {
+  tx_event: Sender<EventUser>,
+  rx_msg: SyncReceiver<RawMessage>,
+}
+
+impl Subscriber {
+  pub fn subscribe(&mut self, configs: SubscribeConfigs) {
+    task::block_on(async {
+      for config in configs.subs {
+        self
+          .tx_event
+          .send(EventUser::AddNewClient(config))
+          .await
+          .unwrap();
+      }
+    });
+  }
+
+  pub fn recv(&mut self) -> Result<RawMessage> {
+    let data = self.rx_msg.recv()?;
+    Ok(data)
+  }
+}
+
+pub fn start_tcp_client(addrs: Vec<String>) -> Subscriber {
   let mut subs = Vec::new();
   for addr in addrs {
-    let sub = OneSubscribe {
+    let sub = OneSubscribeConfig {
       addr,
       topics: Vec::new(),
     };
     subs.push(sub);
   }
-  let config = SubscribeTopics { subs };
-  let (tx, rx) = std::sync::mpsc::channel();
+  let configs = SubscribeConfigs { subs };
+
+  let (tx_event, rx_event) = mpsc::unbounded();
+  let (tx_msg, rx_msg) = std::sync::mpsc::channel();
   thread::spawn(move || {
-    if let Err(err) = task::block_on(run_multi_clients(config, tx)) {
+    if let Err(err) = task::block_on(run_multi_clients(rx_event, tx_msg)) {
       error!("err = {}", err);
     }
   });
-  rx
+
+  let mut s = Subscriber { tx_event, rx_msg };
+  s.subscribe(configs);
+  s
 }
 
-pub fn start_tcp_client_with_topics(config: SubscribeTopics) -> SyncReceiver<RawMessage> {
-  let (tx, rx) = std::sync::mpsc::channel();
+pub fn start_tcp_client_with_topics(configs: SubscribeConfigs) -> Subscriber {
+  let (tx_event, rx_event) = mpsc::unbounded();
+  let (tx_msg, rx_msg) = std::sync::mpsc::channel();
   thread::spawn(move || {
-    if let Err(err) = task::block_on(run_multi_clients(config, tx)) {
+    if let Err(err) = task::block_on(run_multi_clients(rx_event, tx_msg)) {
       error!("err = {}", err);
     }
   });
-  rx
+
+  let mut s = Subscriber { tx_event, rx_msg };
+  s.subscribe(configs);
+  s
 }
 
-async fn run_multi_clients(config: SubscribeTopics, tx: SyncSender<RawMessage>) -> Result<()> {
-  let mut tasks = Vec::new();
-  for sub in config.subs.into_iter() {
-    let t = spawn_and_log_error(client(sub, tx.clone()));
-    tasks.push(t);
+async fn run_multi_clients(
+  mut rx_event: Receiver<EventUser>,
+  tx_msg: SyncSender<RawMessage>,
+) -> Result<()> {
+  loop {
+    select! {
+      event = rx_event.next().fuse() => match event {
+        Some(event) => match event {
+          EventUser::AddNewClient(config) => {
+            spawn_and_log_error(client(config, tx_msg.clone()));
+          }
+        },
+        None => break,
+      },
+    }
   }
-  future::join_all(tasks).await;
   Ok(())
 }
 
-async fn client(sub: OneSubscribe, tx: SyncSender<RawMessage>) -> Result<()> {
+async fn client(sub: OneSubscribeConfig, tx_msg: SyncSender<RawMessage>) -> Result<()> {
   loop {
     match TcpStream::connect(&sub.addr).await {
       Ok(stream) => {
@@ -113,7 +160,7 @@ async fn client(sub: OneSubscribe, tx: SyncSender<RawMessage>) -> Result<()> {
                 };
                 debug!("msg = {:?}", msg);
 
-                tx.send(RawMessage {
+                tx_msg.send(RawMessage {
                   source: msg.source,
                   topic: msg.topic,
                   data: msg.data,
@@ -125,7 +172,7 @@ async fn client(sub: OneSubscribe, tx: SyncSender<RawMessage>) -> Result<()> {
         }
       }
       Err(err) => {
-        error!("err = {}", err);
+        error!("connect to {} failed, err = {}", sub.addr, err);
         task::sleep(Duration::from_secs(5)).await;
         continue;
       }

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 fn main() -> Result<()> {
   env_logger::init();
-  
+
   let mut args = std::env::args();
   let addr = match args.nth(1).as_ref().map(String::as_str) {
     Some(addr) => addr.to_string(),
