@@ -91,11 +91,11 @@ pub struct MsgPublish {
 }
 
 impl MsgPublish {
-  pub fn encode(topic: &str, data: Vec<u8>) -> Vec<u8> {
+  pub fn encode(source: &str, topic: &str, data: Vec<u8>) -> Vec<u8> {
     let msg = MsgPublish {
       version: MSG_VERSION.to_string(),
       msgtype: MSG_TYPE_PUBLISH.to_string(),
-      source: "tcp_server".to_string(),
+      source: source.to_string(),
       topic: topic.to_string(),
       data: data,
     };

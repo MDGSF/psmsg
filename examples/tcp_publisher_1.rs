@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     None => return Err(anyhow!("Usage: server <addr>")),
   };
 
-  let mut p = Publisher::new(addr);
+  let mut p = Publisher::new("s1", &addr);
   for i in 0.. {
     let s = format!("hello world, {}", i);
     p.publish(s.as_bytes().to_vec());

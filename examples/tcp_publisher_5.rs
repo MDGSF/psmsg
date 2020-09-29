@@ -11,16 +11,11 @@ fn main() -> Result<()> {
     None => return Err(anyhow!("Usage: server <addr>")),
   };
 
-  let mut p = Publisher::new(addr);
+  let mut p = Publisher::new("s5", &addr);
   for i in 0.. {
-    let s = format!("hello world, {}", i);
+    let s = format!("{}", i);
     p.publish_topic("t1", s.as_bytes().to_vec());
-    p.publish_topic("t2", s.as_bytes().to_vec());
-    p.publish_topic("t3", s.as_bytes().to_vec());
-    p.publish_topic("t4", s.as_bytes().to_vec());
-    p.publish_topic("t5", s.as_bytes().to_vec());
-    p.publish_topic("t6", s.as_bytes().to_vec());
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(50));
   }
 
   Ok(())

@@ -28,11 +28,12 @@ pub struct Publisher {
 }
 
 impl Publisher {
-  pub fn new(addr: String) -> Publisher {
+  pub fn new(name: &str, addr: &str) -> Publisher {
     let (tx_event_user, rx_event_user) = mpsc::unbounded();
-
+    let name = name.to_string();
+    let addr = addr.to_string();
     thread::spawn(move || {
-      if let Err(err) = task::block_on(accept_loop(addr, rx_event_user)) {
+      if let Err(err) = task::block_on(accept_loop(name, addr, rx_event_user)) {
         error!("err = {}", err);
       }
     });
@@ -66,13 +67,17 @@ impl Publisher {
   }
 }
 
-async fn accept_loop(addr: impl ToSocketAddrs, rx_event_user: Receiver<EventUser>) -> Result<()> {
+async fn accept_loop(
+  name: String,
+  addr: impl ToSocketAddrs,
+  rx_event_user: Receiver<EventUser>,
+) -> Result<()> {
   let listener = TcpListener::bind(addr).await?;
   info!("Listening on {}", listener.local_addr()?);
 
   let mut uniq_client_id: usize = 0;
   let (broker_sender, broker_receiver) = mpsc::unbounded();
-  let broker = task::spawn(broker_loop(broker_receiver, rx_event_user));
+  let broker = task::spawn(broker_loop(name, broker_receiver, rx_event_user));
   let mut incoming = listener.incoming();
   while let Some(stream) = incoming.next().await {
     let stream = stream?;
@@ -185,6 +190,7 @@ enum EventUser {
 }
 
 async fn broker_loop(
+  name: String,
   mut rx_event_client: Receiver<EventClient>,
   mut rx_event_user: Receiver<EventUser>,
 ) {
@@ -245,7 +251,7 @@ async fn broker_loop(
         Some(event) => match event {
           EventUser::Publish { topic, data } => {
             debug!("publish message, topic = {}", topic);
-            let msg = MsgPublish::encode(&topic, data);
+            let msg = MsgPublish::encode(&name, &topic, data);
             if let Some(client_ids) = t2c.get_mut(&topic) {
               for client_id in client_ids.iter() {
                 if let Some(client) = peers.get_mut(&client_id) {
@@ -256,7 +262,7 @@ async fn broker_loop(
           }
           EventUser::PublishAll { data } => {
             debug!("publish all");
-            let msg = MsgPublish::encode("*", data);
+            let msg = MsgPublish::encode(&name, "*", data);
             for (client_id, mut client) in peers.iter() {
               client.send(msg.clone()).await.unwrap();
             }
