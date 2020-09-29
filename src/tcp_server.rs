@@ -28,6 +28,20 @@ pub struct Publisher {
 }
 
 impl Publisher {
+  pub fn new(addr: String) -> Publisher {
+    let (tx_event_user, rx_event_user) = mpsc::unbounded();
+
+    thread::spawn(move || {
+      if let Err(err) = task::block_on(accept_loop(addr, rx_event_user)) {
+        error!("err = {}", err);
+      }
+    });
+
+    Publisher {
+      tx_event: tx_event_user,
+    }
+  }
+
   pub fn publish(&mut self, data: Vec<u8>) {
     task::block_on(async {
       self
@@ -49,20 +63,6 @@ impl Publisher {
         .await
         .unwrap()
     });
-  }
-}
-
-pub fn start_tcp_server(addr: String) -> Publisher {
-  let (tx_event_user, rx_event_user) = mpsc::unbounded();
-
-  thread::spawn(move || {
-    if let Err(err) = task::block_on(accept_loop(addr, rx_event_user)) {
-      error!("err = {}", err);
-    }
-  });
-
-  Publisher {
-    tx_event: tx_event_user,
   }
 }
 
@@ -123,11 +123,16 @@ async fn connection_loop(
           })
           .await?;
       }
-      MSG_TYPE_SUBSCRIBE_ALL => {
+      MSG_TYPE_UNSUBSCRIBE => {
+        let msg = MsgUnSubscribe::decode(&line);
         broker
-          .send(EventClient::SubscribeAll { id: client_id })
+          .send(EventClient::UnSubscribe {
+            id: client_id,
+            topics: msg.topics,
+          })
           .await?;
       }
+      MSG_TYPE_UNSUBSCRIBE_ALL => {}
       &_ => {}
     }
   }
@@ -167,8 +172,9 @@ enum EventClient {
     id: usize,
     topics: Vec<String>,
   },
-  SubscribeAll {
+  UnSubscribe {
     id: usize,
+    topics: Vec<String>,
   },
 }
 
@@ -188,9 +194,6 @@ async fn broker_loop(
   // <topic, set<client_id>>
   let mut t2c: HashMap<String, HashSet<usize>> = HashMap::new();
   let mut c2t: HashMap<usize, HashSet<String>> = HashMap::new();
-
-  // subscribe all topic's client's id
-  let mut suball: HashSet<usize> = HashSet::new();
 
   // <client_id, send out>
   let (disconnect_sender, mut disconnect_receiver) =
@@ -219,17 +222,21 @@ async fn broker_loop(
               }
             },
             EventClient::Subscribe { id, topics } => {
-              if !suball.contains(&id) {
-                for topic in topics {
-                  t2c.entry(topic.clone()).or_insert_with(|| HashSet::new()).insert(id);
-                  c2t.entry(id).or_insert_with(|| HashSet::new()).insert(topic);
+              for topic in topics {
+                t2c.entry(topic.clone()).or_insert_with(|| HashSet::new()).insert(id);
+                c2t.entry(id).or_insert_with(|| HashSet::new()).insert(topic);
+              }
+            },
+            EventClient::UnSubscribe { id, topics } => {
+              for topic in topics {
+                if let Some(topic_client_ids) = t2c.get_mut(&topic) {
+                  topic_client_ids.remove(&id);
+                }
+                if let Some(client_topics) = c2t.get_mut(&id) {
+                  client_topics.remove(&topic);
                 }
               }
             },
-            EventClient::SubscribeAll { id } => {
-              debug!("[{}]: subscribe all topics", id);
-              suball.insert(id);
-            }
           }
         },
         None => break,
@@ -246,11 +253,6 @@ async fn broker_loop(
                 }
               }
             }
-            for id in suball.iter() {
-              if let Some(client) = peers.get_mut(&id) {
-                client.send(msg.clone()).await.unwrap();
-              }
-            }
           }
           EventUser::PublishAll { data } => {
             debug!("publish all");
@@ -265,7 +267,6 @@ async fn broker_loop(
       disconnect = disconnect_receiver.next().fuse() => {
         let (id, _pending_messages) = disconnect.unwrap();
         assert!(peers.remove(&id).is_some());
-        suball.remove(&id);
         if let Some(topics) = c2t.get_mut(&id) {
           for topic in topics.iter() {
             if let Some(client_ids) = t2c.get_mut(topic) {

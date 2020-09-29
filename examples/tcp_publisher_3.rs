@@ -15,6 +15,11 @@ fn main() -> Result<()> {
   for i in 0.. {
     let s = format!("hello world, {}", i);
     p.publish_topic("t1", s.as_bytes().to_vec());
+    p.publish_topic("t2", s.as_bytes().to_vec());
+    p.publish_topic("t3", s.as_bytes().to_vec());
+    p.publish_topic("t4", s.as_bytes().to_vec());
+    p.publish_topic("t5", s.as_bytes().to_vec());
+    p.publish_topic("t6", s.as_bytes().to_vec());
     std::thread::sleep(Duration::from_secs(1));
   }
 

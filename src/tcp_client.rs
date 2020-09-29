@@ -3,7 +3,14 @@ use crate::messages::*;
 use anyhow::Result;
 use async_std::{io::BufReader, net::TcpStream, prelude::*, task};
 use futures::{channel::mpsc, select, FutureExt, SinkExt};
-use std::{thread, time::Duration};
+use std::{
+  collections::{
+    hash_map::{Entry, HashMap},
+    HashSet,
+  },
+  thread,
+  time::Duration,
+};
 
 type Sender<T> = mpsc::UnboundedSender<T>;
 type Receiver<T> = mpsc::UnboundedReceiver<T>;
@@ -11,14 +18,9 @@ type SyncSender<T> = std::sync::mpsc::Sender<T>;
 type SyncReceiver<T> = std::sync::mpsc::Receiver<T>;
 
 #[derive(Debug)]
-pub struct OneSubscribeConfig {
+struct OneSubscribeConfig {
   pub addr: String,
-  pub topics: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct SubscribeConfigs {
-  pub subs: Vec<OneSubscribeConfig>,
+  pub topic: String,
 }
 
 #[derive(Debug)]
@@ -30,7 +32,9 @@ pub struct RawMessage {
 
 #[derive(Debug)]
 enum EventUser {
-  AddNewClient(OneSubscribeConfig),
+  AddNewClient(String),
+  ClientSubscribeTopic(OneSubscribeConfig),
+  ClientUnSubscribeTopic(OneSubscribeConfig),
 }
 
 pub struct Subscriber {
@@ -39,15 +43,50 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-  pub fn subscribe(&mut self, configs: SubscribeConfigs) {
-    task::block_on(async {
-      for config in configs.subs {
-        self
-          .tx_event
-          .send(EventUser::AddNewClient(config))
-          .await
-          .unwrap();
+  pub fn new() -> Subscriber {
+    let (tx_event, rx_event) = mpsc::unbounded();
+    let (tx_msg, rx_msg) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+      if let Err(err) = task::block_on(run_multi_clients(rx_event, tx_msg)) {
+        error!("err = {}", err);
       }
+    });
+    Subscriber { tx_event, rx_msg }
+  }
+
+  pub fn connect(&mut self, addr: &str) {
+    task::block_on(async {
+      self
+        .tx_event
+        .send(EventUser::AddNewClient(addr.to_string()))
+        .await
+        .unwrap();
+    });
+  }
+
+  pub fn subscribe(&mut self, addr: &str, topic: &str) {
+    task::block_on(async {
+      self
+        .tx_event
+        .send(EventUser::ClientSubscribeTopic(OneSubscribeConfig {
+          addr: addr.to_string(),
+          topic: topic.to_string(),
+        }))
+        .await
+        .unwrap();
+    });
+  }
+
+  pub fn unsubscribe(&mut self, addr: &str, topic: &str) {
+    task::block_on(async {
+      self
+        .tx_event
+        .send(EventUser::ClientUnSubscribeTopic(OneSubscribeConfig {
+          addr: addr.to_string(),
+          topic: topic.to_string(),
+        }))
+        .await
+        .unwrap();
     });
   }
 
@@ -57,54 +96,34 @@ impl Subscriber {
   }
 }
 
-pub fn start_tcp_client(addrs: Vec<String>) -> Subscriber {
-  let mut subs = Vec::new();
-  for addr in addrs {
-    let sub = OneSubscribeConfig {
-      addr,
-      topics: Vec::new(),
-    };
-    subs.push(sub);
-  }
-  let configs = SubscribeConfigs { subs };
-
-  let (tx_event, rx_event) = mpsc::unbounded();
-  let (tx_msg, rx_msg) = std::sync::mpsc::channel();
-  thread::spawn(move || {
-    if let Err(err) = task::block_on(run_multi_clients(rx_event, tx_msg)) {
-      error!("err = {}", err);
-    }
-  });
-
-  let mut s = Subscriber { tx_event, rx_msg };
-  s.subscribe(configs);
-  s
-}
-
-pub fn start_tcp_client_with_topics(configs: SubscribeConfigs) -> Subscriber {
-  let (tx_event, rx_event) = mpsc::unbounded();
-  let (tx_msg, rx_msg) = std::sync::mpsc::channel();
-  thread::spawn(move || {
-    if let Err(err) = task::block_on(run_multi_clients(rx_event, tx_msg)) {
-      error!("err = {}", err);
-    }
-  });
-
-  let mut s = Subscriber { tx_event, rx_msg };
-  s.subscribe(configs);
-  s
-}
-
 async fn run_multi_clients(
   mut rx_event: Receiver<EventUser>,
   tx_msg: SyncSender<RawMessage>,
 ) -> Result<()> {
+  let mut peers: HashMap<String, Sender<EventUser>> = HashMap::new();
+
   loop {
     select! {
       event = rx_event.next().fuse() => match event {
         Some(event) => match event {
-          EventUser::AddNewClient(config) => {
-            spawn_and_log_error(client(config, tx_msg.clone()));
+          EventUser::AddNewClient(addr) => match peers.entry(addr.clone()) {
+            Entry::Occupied(..) => {}
+            Entry::Vacant(entry) => {
+              println!("new connection to {}", addr);
+              let (tx_client_event, rx_client_event) = mpsc::unbounded();
+              entry.insert(tx_client_event);
+              spawn_and_log_error(client(addr, rx_client_event, tx_msg.clone()));
+            }
+          },
+          EventUser::ClientSubscribeTopic(ref config) => {
+            if let Some(tx_client_event) = peers.get_mut(&config.addr) {
+              tx_client_event.send(event).await.unwrap();
+            }
+          },
+          EventUser::ClientUnSubscribeTopic(ref config) => {
+            if let Some(tx_client_event) = peers.get_mut(&config.addr) {
+              tx_client_event.send(event).await.unwrap();
+            }
           }
         },
         None => break,
@@ -114,27 +133,46 @@ async fn run_multi_clients(
   Ok(())
 }
 
-async fn client(sub: OneSubscribeConfig, tx_msg: SyncSender<RawMessage>) -> Result<()> {
+async fn client(
+  addr: String,
+  mut rx_event: Receiver<EventUser>,
+  tx_msg: SyncSender<RawMessage>,
+) -> Result<()> {
+  let mut topics = HashSet::new();
+
   loop {
-    match TcpStream::connect(&sub.addr).await {
+    match TcpStream::connect(&addr).await {
       Ok(stream) => {
         debug!("Connected to {}", &stream.peer_addr()?);
         let (reader, mut writer) = (&stream, &stream);
         let reader = BufReader::new(reader);
         let mut lines_from_server = StreamExt::fuse(reader.lines());
 
-        if sub.topics.is_empty() {
-          let msg = MsgSubscribeAll::encode();
+        if !topics.is_empty() {
+          let msg = MsgSubscribe::encode(topics.clone().into_iter().collect());
           writer.write_all(&msg).await?;
-          debug!("Subscribe to all topics");
-        } else {
-          let msg = MsgSubscribe::encode(sub.topics.clone());
-          writer.write_all(&msg).await?;
-          debug!("Subscribe to topics: {:?}", sub.topics);
         }
 
         loop {
           select! {
+            event = rx_event.next().fuse() => match event {
+              Some(event) => match event {
+                EventUser::ClientSubscribeTopic(config) => {
+                  topics.insert(config.topic.clone());
+                  if !topics.is_empty() {
+                    let msg = MsgSubscribe::encode(vec![config.topic]);
+                    writer.write_all(&msg).await?;
+                  }
+                },
+                EventUser::ClientUnSubscribeTopic(config) => {
+                  topics.remove(&config.topic);
+                  let msg = MsgUnSubscribe::encode(vec![config.topic]);
+                  writer.write_all(&msg).await?;
+                }
+                _ => break,
+              },
+              None => break,
+            },
             line = lines_from_server.next().fuse() => match line {
               Some(line) => {
                 let line = line?;
@@ -153,7 +191,7 @@ async fn client(sub: OneSubscribeConfig, tx_msg: SyncSender<RawMessage>) -> Resu
         }
       }
       Err(err) => {
-        error!("connect to {} failed, err = {}", sub.addr, err);
+        error!("connect to {} failed, err = {}", addr, err);
         task::sleep(Duration::from_secs(5)).await;
         continue;
       }

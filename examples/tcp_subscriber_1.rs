@@ -1,15 +1,14 @@
 use anyhow::Result;
-use psmsg;
+use psmsg::{self, Subscriber};
 
 fn main() -> Result<()> {
   env_logger::init();
 
-  let mut rx = psmsg::start_tcp_client(vec![
-    "127.0.0.1:8080".to_string(),
-    "127.0.0.1:8081".to_string(),
-  ]);
+  let mut client = Subscriber::new();
+  client.connect("127.0.0.1:8080");
+  client.connect("127.0.0.1:8081");
   loop {
-    let msg = rx.recv()?;
+    let msg = client.recv()?;
     println!(
       "[{}]<{}>: {}",
       msg.source,

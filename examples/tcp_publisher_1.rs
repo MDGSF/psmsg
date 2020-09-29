@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use psmsg;
+use psmsg::{self, Publisher};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     None => return Err(anyhow!("Usage: server <addr>")),
   };
 
-  let mut p = psmsg::start_tcp_server(addr);
+  let mut p = Publisher::new(addr);
   for i in 0.. {
     let s = format!("hello world, {}", i);
     p.publish(s.as_bytes().to_vec());

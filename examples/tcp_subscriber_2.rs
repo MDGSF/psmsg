@@ -1,25 +1,17 @@
 use anyhow::Result;
-use psmsg;
+use psmsg::{self, Subscriber};
 
 fn main() -> Result<()> {
   env_logger::init();
 
-  let mut subs = Vec::new();
-  let sub1 = psmsg::OneSubscribeConfig {
-    addr: "127.0.0.1:8080".to_string(),
-    topics: vec!["t2".to_string(), "t1".to_string()],
-  };
-  subs.push(sub1);
-  let sub2 = psmsg::OneSubscribeConfig {
-    addr: "127.0.0.1:8081".to_string(),
-    topics: vec!["t1".to_string()],
-  };
-  subs.push(sub2);
-  let config = psmsg::SubscribeConfigs { subs };
-
-  let mut rx = psmsg::start_tcp_client_with_topics(config);
+  let mut client = Subscriber::new();
+  client.connect("127.0.0.1:8080");
+  client.connect("127.0.0.1:8081");
+  client.subscribe("127.0.0.1:8080", "t1");
+  client.subscribe("127.0.0.1:8080", "t2");
+  client.subscribe("127.0.0.1:8081", "t1");
   loop {
-    let msg = rx.recv()?;
+    let msg = client.recv()?;
     println!(
       "[{}]<{}>: {}",
       msg.source,
