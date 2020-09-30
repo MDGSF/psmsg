@@ -97,11 +97,12 @@ impl Subscriber {
 }
 
 async fn run_multi_clients(
-  mut rx_event: Receiver<EventUser>,
+  rx_event: Receiver<EventUser>,
   tx_msg: SyncSender<RawMessage>,
 ) -> Result<()> {
   let mut peers: HashMap<String, Sender<EventUser>> = HashMap::new();
 
+  let mut rx_event = StreamExt::fuse(rx_event);
   loop {
     select! {
       event = rx_event.next().fuse() => match event {
@@ -109,7 +110,6 @@ async fn run_multi_clients(
           EventUser::AddNewClient(addr) => match peers.entry(addr.clone()) {
             Entry::Occupied(..) => {}
             Entry::Vacant(entry) => {
-              println!("new connection to {}", addr);
               let (tx_client_event, rx_client_event) = mpsc::unbounded();
               entry.insert(tx_client_event);
               spawn_and_log_error(client(addr, rx_client_event, tx_msg.clone()));
@@ -130,17 +130,19 @@ async fn run_multi_clients(
       },
     }
   }
+
   Ok(())
 }
 
 async fn client(
   addr: String,
-  mut rx_event: Receiver<EventUser>,
+  rx_event: Receiver<EventUser>,
   tx_msg: SyncSender<RawMessage>,
 ) -> Result<()> {
   let mut topics = HashSet::new();
 
-  loop {
+  let mut rx_event = StreamExt::fuse(rx_event);
+  'outer: loop {
     match TcpStream::connect(&addr).await {
       Ok(stream) => {
         debug!("Connected to {}", &stream.peer_addr()?);
@@ -171,7 +173,9 @@ async fn client(
                 }
                 _ => break,
               },
-              None => break,
+              None => {
+                break 'outer;
+              }
             },
             line = lines_from_server.next().fuse() => match line {
               Some(line) => {
@@ -192,9 +196,10 @@ async fn client(
       }
       Err(err) => {
         error!("connect to {} failed, err = {}", addr, err);
-        task::sleep(Duration::from_secs(5)).await;
+        task::sleep(Duration::from_secs(1)).await;
         continue;
       }
     }
   }
+  Ok(())
 }
