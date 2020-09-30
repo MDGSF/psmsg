@@ -25,21 +25,24 @@ enum Void {}
 
 pub struct Publisher {
   tx_event: Sender<EventUser>,
+  _tx_shut_down: Sender<()>,
 }
 
 impl Publisher {
   pub fn new(name: &str, addr: &str) -> Publisher {
     let (tx_event_user, rx_event_user) = mpsc::unbounded();
+    let (tx_shut_down, rx_shut_down) = mpsc::unbounded();
     let name = name.to_string();
     let addr = addr.to_string();
     thread::spawn(move || {
-      if let Err(err) = task::block_on(accept_loop(name, addr, rx_event_user)) {
+      if let Err(err) = task::block_on(accept_loop(name, addr, rx_event_user, rx_shut_down)) {
         error!("err = {}", err);
       }
     });
 
     Publisher {
       tx_event: tx_event_user,
+      _tx_shut_down: tx_shut_down,
     }
   }
 
@@ -71,23 +74,39 @@ async fn accept_loop(
   name: String,
   addr: impl ToSocketAddrs,
   rx_event_user: Receiver<EventUser>,
+  rx_shut_down: Receiver<()>,
 ) -> Result<()> {
   let listener = TcpListener::bind(addr).await?;
   info!("Listening on {}", listener.local_addr()?);
 
   let mut uniq_client_id: usize = 0;
+  let mut peers: HashMap<usize, Sender<()>> = HashMap::new();
+
   let (broker_sender, broker_receiver) = mpsc::unbounded();
   let broker = task::spawn(broker_loop(name, broker_receiver, rx_event_user));
-  let mut incoming = listener.incoming();
-  while let Some(stream) = incoming.next().await {
-    let stream = stream?;
-    info!("Accepting from: {}", stream.peer_addr()?);
-    uniq_client_id += 1;
-    spawn_and_log_error(connection_loop(
-      uniq_client_id,
-      broker_sender.clone(),
-      stream,
-    ));
+  let incoming = listener.incoming();
+  let mut incoming = StreamExt::fuse(incoming);
+  let mut rx_shut_down = StreamExt::fuse(rx_shut_down);
+  loop {
+    select! {
+      stream = incoming.next().fuse() => match stream {
+        Some(stream) => {
+          let stream = stream?;
+          info!("Accepting from: {}", stream.peer_addr()?);
+          uniq_client_id += 1;
+          let (tx_conn_shutdown, rx_conn_shutdown) = mpsc::unbounded();
+          peers.insert(uniq_client_id, tx_conn_shutdown);
+          spawn_and_log_error(connection_loop(
+            uniq_client_id,
+            broker_sender.clone(),
+            stream,
+            rx_conn_shutdown,
+          ));
+        },
+        None => break,
+      },
+      _ = rx_shut_down.next().fuse() => break,
+    }
   }
   drop(broker_sender);
   broker.await;
@@ -99,10 +118,12 @@ async fn connection_loop(
   client_id: usize,
   mut broker: Sender<EventClient>,
   stream: TcpStream,
+  rx_conn_shutdown: Receiver<()>,
 ) -> Result<()> {
   let stream = Arc::new(stream);
   let reader = BufReader::new(&*stream);
-  let mut lines = reader.lines();
+  let mut lines = StreamExt::fuse(reader.lines());
+  let mut rx_conn_shutdown = StreamExt::fuse(rx_conn_shutdown);
 
   let (_shutdown_sender, shutdown_receiver) = mpsc::unbounded::<Void>();
   broker
@@ -113,32 +134,40 @@ async fn connection_loop(
     })
     .await?;
 
-  while let Some(line) = lines.next().await {
-    let line = line?;
-    debug!("[{}]: {}", client_id, line);
+  loop {
+    select! {
+      line = lines.next().fuse() => match line {
+        Some(line) => {
+          let line = line?;
+          debug!("[{}]: {}", client_id, line);
 
-    let msg = MsgHeader::decode(&line);
-    match msg.msgtype.as_str() {
-      MSG_TYPE_SUBSCRIBE => {
-        let msg = MsgSubscribe::decode(&line);
-        broker
-          .send(EventClient::Subscribe {
-            id: client_id,
-            topics: msg.topics,
-          })
-          .await?;
-      }
-      MSG_TYPE_UNSUBSCRIBE => {
-        let msg = MsgUnSubscribe::decode(&line);
-        broker
-          .send(EventClient::UnSubscribe {
-            id: client_id,
-            topics: msg.topics,
-          })
-          .await?;
-      }
-      MSG_TYPE_UNSUBSCRIBE_ALL => {}
-      &_ => {}
+          let msg = MsgHeader::decode(&line);
+          match msg.msgtype.as_str() {
+            MSG_TYPE_SUBSCRIBE => {
+              let msg = MsgSubscribe::decode(&line);
+              broker
+                .send(EventClient::Subscribe {
+                  id: client_id,
+                  topics: msg.topics,
+                })
+                .await?;
+            }
+            MSG_TYPE_UNSUBSCRIBE => {
+              let msg = MsgUnSubscribe::decode(&line);
+              broker
+                .send(EventClient::UnSubscribe {
+                  id: client_id,
+                  topics: msg.topics,
+                })
+                .await?;
+            }
+            MSG_TYPE_UNSUBSCRIBE_ALL => {}
+            &_ => {}
+          }
+        },
+        None => break,
+      },
+      _ = rx_conn_shutdown.next().fuse() => break,
     }
   }
 
